@@ -106,7 +106,7 @@ class Simulator(Backend):
         
         if dest_occupied:
             self._board.pop(dest_index)
-        
+        # print('moved')
         if piece_color == 'White':
             self._semaphore = self.SEMAPHORE_BLACK_TURN
         else:
