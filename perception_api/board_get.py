@@ -1,457 +1,288 @@
+# label_with_embeddings.py
+import os
+import csv
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
 import cv2
 import numpy as np
-from pathlib import Path
-import json
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
 
-# ====== SET YOUR IMAGE PATH HERE ======
-IN_PATH = Path("/Users/andredelacruz/Documents/GitHub/cpchess/perception_api/test.png")
-# ======================================
+# ============== CONFIG ==============
+ROOT            = Path("/Users/andredelacruz/Documents/GitHub/cpchess/perception_api")
+DATA_REFS_DIR   = ROOT / "data_refs"                       # fallback gallery if no .pt/.csv
+EMB_TENSOR_PATH = ROOT / "embeddings_master.pt"            # optional prebuilt embeddings
+EMB_META_PATH   = ROOT / "embeddings_master_meta.csv"      # optional meta for .pt
+OUT_DIR         = ROOT                                     # where CSV + annotated image go
+WEBCAM_INDEX    = 0
+BOARD_SIDE      = 900
+PATTERN_SIZE    = (7, 7)                                   # 7x7 inner corners
+MODEL_NAME      = "openai/clip-vit-base-patch32"
+CONF_UNKNOWN_TH = 0.2   # if max cosine < this, label as "empty"
+# ====================================
 
-OUT_DIR = IN_PATH.parent
-OUT_GRID = OUT_DIR / "inner_square_with_grid.png"
+# ====== CLIP ======
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(device).eval()
+clip_proc  = CLIPProcessor.from_pretrained(MODEL_NAME)
 
-# ---------------- TUNABLES ----------------
-LOWER_BLUE = np.array([90, 60, 40], dtype=np.uint8)
-LOWER_BLUE_REMOVAL = np.array([90, 100, 100], dtype=np.uint8)
-UPPER_BLUE = np.array([120, 255, 255], dtype=np.uint8)
-BOARD_SIDE = 800
-EDGE_MARGIN_FRAC = 0.05
-CLOSE_K = 5
-MIN_INNER_AREA_FRAC = 0.02
-AR_TOL = 2
-RECTANGULARITY_MIN = 0.75
-LOWER_RED1 = np.array([0, 100, 80], dtype=np.uint8)
-UPPER_RED1 = np.array([10, 255, 255], dtype=np.uint8)
-LOWER_RED2 = np.array([160, 100, 80], dtype=np.uint8)
-UPPER_RED2 = np.array([179, 255, 255], dtype=np.uint8)
+@torch.no_grad()
+def embed_bgr(img_bgr: np.ndarray) -> torch.Tensor:
+    """Return L2-normalized CLIP image embedding (1xD)."""
+    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    inputs = clip_proc(images=pil, return_tensors="pt").to(device)
+    feats  = clip_model.get_image_features(**inputs)
+    return F.normalize(feats, p=2, dim=-1)  # [1, D]
 
-# Placeholder ranges for other pieces
-# TODO: Adjust these later with real colors
-LOWER_KNIGHT, UPPER_KNIGHT = None, None
-LOWER_ROOK,   UPPER_ROOK   = None, None
-LOWER_BISHOP, UPPER_BISHOP = None, None
-LOWER_QUEEN,  UPPER_QUEEN  = None, None
-# ------------------------------------------
-def _odd(k): 
-    return int(k) + 1 - (int(k) % 2)  # make odd
+@torch.no_grad()
+def embed_paths(paths: list[Path]) -> torch.Tensor:
+    """Batch-embed image paths → NxD (L2-normalized)."""
+    if not paths:
+        return torch.empty(0, clip_model.config.projection_dim)
+    embs = []
+    batch = []
+    for p in paths:
+        try:
+            pil = Image.open(p).convert("RGB")
+            batch.append(pil)
+            if len(batch) == 16:
+                inputs = clip_proc(images=batch, return_tensors="pt").to(device)
+                feats  = clip_model.get_image_features(**inputs)
+                embs.append(F.normalize(feats, p=2, dim=-1))
+                batch = []
+        except Exception:
+            pass
+    if batch:
+        inputs = clip_proc(images=batch, return_tensors="pt").to(device)
+        feats  = clip_model.get_image_features(**inputs)
+        embs.append(F.normalize(feats, p=2, dim=-1))
+    return torch.cat(embs, dim=0).cpu()
 
-def estimate_grid_positions(crop, n=9, win_frac=0.045, smooth_frac=0.035):
-    """
-    Return (verticals, horizontals) 1D indices for the n grid lines in each direction.
-    Uses Sobel projections + local peak search around the expected equal-spaced locations.
-    """
-    h, w = crop.shape[:2]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+# ====== Board helpers ======
+def gray_world_white_balance(bgr):
+    b, g, r = cv2.split(bgr.astype(np.float32))
+    m = (b.mean() + g.mean() + r.mean()) / 3.0
+    eps = 1e-6
+    b *= (m / (b.mean() + eps)); g *= (m / (g.mean() + eps)); r *= (m / (r.mean() + eps))
+    return np.clip(cv2.merge([b, g, r]), 0, 255).astype(np.uint8)
 
-    # Light blur so tiny piece edges don't dominate
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
+def compute_homography(frame_bgr):
+    """Use WB+CLAHE for stable corner detection; warp ORIGINAL frame colors."""
+    wb = gray_world_white_balance(frame_bgr)
+    gray = cv2.cvtColor(wb, cv2.COLOR_BGR2GRAY)
+    gray = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(gray)
 
-    # Sobel gradients (vertical lines => strong d/dx; horizontal lines => strong d/dy)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    ok, corners = False, None
+    try:
+        res = cv2.findChessboardCornersSB(
+            gray, PATTERN_SIZE,
+            flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+        )
+        if isinstance(res, tuple):
+            ok, pts = res
+            corners = pts if ok else None
+        else:
+            ok = res is not None
+            corners = res
+    except Exception:
+        ok = False
 
-    # Column/row "gridness" scores
-    vert_score = np.mean(np.abs(gx), axis=0)   # length w
-    horiz_score = np.mean(np.abs(gy), axis=1)  # length h
+    if not ok:
+        flags = (cv2.CALIB_CB_ADAPTIVE_THRESH |
+                 cv2.CALIB_CB_NORMALIZE_IMAGE |
+                 cv2.CALIB_CB_FAST_CHECK)
+        ok, corners = cv2.findChessboardCorners(gray, PATTERN_SIZE, flags)
+        if ok:
+            term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.001)
+            corners = cv2.cornerSubPix(gray, corners, (5,5), (-1,-1), term)
 
-    # Smooth the 1D signals (kernel size proportional to size, and odd)
-    kx = _odd(max(7, int(w * smooth_frac)))
-    ky = _odd(max(7, int(h * smooth_frac)))
-    vert_score = cv2.GaussianBlur(vert_score.reshape(1,-1), (1, kx), 0).ravel()
-    horiz_score = cv2.GaussianBlur(horiz_score.reshape(-1,1), (ky, 1), 0).ravel()
+    if not ok or corners is None:
+        raise RuntimeError("Could not find chessboard inner corners (7x7).")
 
-    # Start from equal spacing, then snap each line to the strongest local peak nearby
-    vx = np.linspace(0, w-1, n).astype(int)
-    vy = np.linspace(0, h-1, n).astype(int)
+    tl = corners[0, 0]; tr = corners[6, 0]; bl = corners[42, 0]; br = corners[48, 0]
+    src_inner = np.array([tl, tr, br, bl], dtype=np.float32)
 
-    wx = max(3, int(w * win_frac))   # +/- window in which to search for a better peak
-    wy = max(3, int(h * win_frac))
+    S = BOARD_SIDE / 8.0
+    dst_inner = np.array([[1*S,1*S],[7*S,1*S],[7*S,7*S],[1*S,7*S]], dtype=np.float32)
+    return cv2.getPerspectiveTransform(src_inner, dst_inner)
 
-    def snap_peaks(starts, score, win, limit):
-        snapped = []
-        for s in starts:
-            a = max(0, s - win)
-            b = min(limit-1, s + win)
-            local = score[a:b+1]
-            j = np.argmax(local)
-            snapped.append(int(a + j))
-        # enforce monotonic order and unique indices
-        snapped = np.clip(np.array(snapped, dtype=int), 0, limit-1)
-        snapped = np.maximum.accumulate(snapped)           # monotonic non-decreasing
-        # if any duplicates (rare), spread them minimally
-        for i in range(1, len(snapped)):
-            if snapped[i] <= snapped[i-1]:
-                snapped[i] = min(limit-1, snapped[i-1] + 1)
-        return snapped.tolist()
+def capture_frame(index=0):
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open camera.")
+    # Try to stabilize camera (driver dependent; safe to keep)
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError("Failed to capture image.")
+    return frame
 
-    verticals   = snap_peaks(vx, vert_score, wx, w)
-    horizontals = snap_peaks(vy, horiz_score, wy, h)
+def split_grid(warp_bgr):
+    """Return list of (name,(x1,y1,x2,y2),crop_bgr) for all 64 squares A1..H8 (top→bottom, left→right)."""
+    h, w = warp_bgr.shape[:2]
+    Xs = np.round(np.linspace(0, w-1, 9)).astype(int)
+    Ys = np.round(np.linspace(0, h-1, 9)).astype(int)
+    ranks = [chr(ord('A') + i) for i in range(8)]  # A..H
+    files = [str(i) for i in range(1, 9)]          # 1..8
 
-    # Sanity: require first/last near edges; if not, fall back to exact linspace
-    if verticals[0] > w*0.05 or verticals[-1] < w*0.95 or \
-       horizontals[0] > h*0.05 or horizontals[-1] < h*0.95:
-        verticals   = np.linspace(0, w-1, n).astype(int).tolist()
-        horizontals = np.linspace(0, h-1, n).astype(int).tolist()
+    squares = []
+    for r in range(8):
+        for c in range(8):
+            x1, x2 = Xs[c], Xs[c+1]
+            y1, y2 = Ys[r], Ys[r+1]
+            crop = warp_bgr[y1:y2, x1:x2].copy()
+            name = f"{ranks[r]}{files[c]}"
+            squares.append((name, (x1,y1,x2,y2), crop))
+    return squares
 
-    return verticals, horizontals
+# ====== Gallery / Prototypes ======
+def label_to_color_piece(label: str):
+    """Map 'white_pawn' -> ('White','P'), 'empty' -> ('none','empty')."""
+    if label == "empty":
+        return ("none", "empty")
+    parts = label.split("_", 1)
+    if len(parts) != 2:
+        return ("none", "empty")
+    color = "White" if parts[0].lower() == "white" else "Black"
+    piece_map = {"pawn":"P","knight":"N","bishop":"B","rook":"R","queen":"Q","king":"K"}
+    piece = piece_map.get(parts[1].lower(), "P")
+    return (color, piece)
 
-def order_corners(pts):
-    pts = np.array(pts, dtype=np.float32).reshape(-1, 2)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
-    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]; bl = pts[np.argmax(d)]
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+def build_prototypes_from_pt_csv():
+    """Load embeddings_master.pt and meta CSV → dict[label] = prototype (1xD tensor)."""
+    if not (EMB_TENSOR_PATH.exists() and EMB_META_PATH.exists()):
+        return None
 
-def find_largest_blue_quad(img_bgr):
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, LOWER_BLUE, UPPER_BLUE)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None; best_area = 0
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < 1000: 
+    # Load embeddings (NxD) and meta
+    E = torch.load(EMB_TENSOR_PATH, map_location="cpu")  # NxD
+    labels = []
+    with open(EMB_META_PATH, "r") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            labels.append(row.get("label","empty"))
+    if len(labels) != E.shape[0]:
+        print("[WARN] Embedding/meta count mismatch — falling back to data_refs.")
+        return None
+
+    buckets = defaultdict(list)
+    for i, lab in enumerate(labels):
+        buckets[lab].append(E[i:i+1])
+
+    prototypes = {}
+    for lab, tensors in buckets.items():
+        X = torch.cat(tensors, dim=0)         # k x D
+        mu = F.normalize(X.mean(dim=0, keepdim=True), p=2, dim=-1)  # 1 x D
+        prototypes[lab] = mu
+    return prototypes
+
+def build_prototypes_from_data_refs():
+    """Walk data_refs/<label>/*.png → embed → mean per label."""
+    if not DATA_REFS_DIR.exists():
+        return {}
+
+    prototypes = {}
+    for lab_dir in sorted(DATA_REFS_DIR.iterdir()):
+        if not lab_dir.is_dir():
             continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx) and area > best_area:
-            best_area = area
-            best = approx
-    return best  
+        imgs = sorted([p for p in lab_dir.glob("*.png")] + [p for p in lab_dir.glob("*.jpg")] + [p for p in lab_dir.glob("*.jpeg")])
+        if not imgs:
+            continue
+        embs = embed_paths(imgs)  # NxD
+        if embs.shape[0] == 0:
+            continue
+        mu = F.normalize(embs.mean(dim=0, keepdim=True), p=2, dim=-1)  # 1xD
+        prototypes[lab_dir.name] = mu
+    return prototypes
 
-def rectangularity(cnt):
-    a = max(cv2.contourArea(cnt), 1.0)
-    rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect)
-    box_a = max(cv2.contourArea(box.astype(np.int32)), 1.0)
-    return a / box_a
+def load_prototypes():
+    protos = build_prototypes_from_pt_csv()
+    if protos is not None and len(protos) > 0:
+        print(f"[INFO] Loaded prototypes from {EMB_TENSOR_PATH.name} + {EMB_META_PATH.name} ({len(protos)} classes).")
+        return protos
+    protos = build_prototypes_from_data_refs()
+    print(f"[INFO] Built prototypes from {DATA_REFS_DIR} ({len(protos)} classes).")
+    return protos
 
-def snap_rect_to_square(rect):
-    (cx, cy), (w, h), ang = rect
-    side = max(w, h)
-    return ((cx, cy), (side, side), ang)
+# ====== Classification ======
+def classify_roi(roi_bgr, prototypes: dict[str, torch.Tensor]):
+    """Return (label, cosine) by nearest prototype; apply CONF_UNKNOWN_TH to map to 'empty' if low."""
+    if roi_bgr.size == 0:
+        return "empty", 0.0
+    x = embed_bgr(roi_bgr).cpu()  # 1xD
+    best_lab, best_cos = "empty", -1.0
+    for lab, proto in prototypes.items():
+        cos = float((x @ proto.T).item())  # cosine (since both are normalized)
+        if cos > best_cos:
+            best_cos, best_lab = cos, lab
 
-def rect_to_points(rect):
-    box = cv2.boxPoints(rect)
-    return order_corners(box)
+    # Unknown handling
+    if best_cos < CONF_UNKNOWN_TH:
+        return "empty", best_cos
+    return best_lab, best_cos
 
+def label_to_drawables(label: str):
+    color, piece = label_to_color_piece(label)
+    if color == "none":
+        return "empty", color, piece
+    return f"{color} {piece}", color, piece
+
+# ====== Main ======
 def main():
-    img = cv2.imread(str(IN_PATH))
-    if img is None:
-        raise FileNotFoundError(f"Could not load image: {IN_PATH}")
+    # 1) Load prototypes
+    prototypes = load_prototypes()
+    if not prototypes:
+        print("[ERROR] No prototypes found. Collect data in data_refs/ or via embeddings_master first.")
+        return
 
-    # Outer square detection and warp
-    outer_quad = find_largest_blue_quad(img)
-    if outer_quad is None:
-        raise RuntimeError("Outer blue square not found.")
-    outer_quad = order_corners(outer_quad.reshape(-1,2))
+    # 2) Capture + warp
+    frame = capture_frame(WEBCAM_INDEX)
+    try:
+        H = compute_homography(frame)
+    except Exception as e:
+        print(f"[ERROR] Could not find board corners: {e}")
+        return
+    warp = cv2.warpPerspective(frame, H, (BOARD_SIDE, BOARD_SIDE))
 
-    dst = np.array([[0,0],[BOARD_SIDE-1,0],[BOARD_SIDE-1,BOARD_SIDE-1],[0,BOARD_SIDE-1]], dtype=np.float32)
-    H = cv2.getPerspectiveTransform(outer_quad, dst)
-    warp = cv2.warpPerspective(img, H, (BOARD_SIDE, BOARD_SIDE))
+    # 3) Split squares
+    squares = split_grid(warp)
 
-    # Mask for inner square
-    hsv = cv2.cvtColor(warp, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, LOWER_BLUE, UPPER_BLUE)
-    margin = int(BOARD_SIDE * EDGE_MARGIN_FRAC)
-    center_mask = np.zeros_like(mask)
-    cv2.rectangle(center_mask, (margin, margin), (BOARD_SIDE - margin, BOARD_SIDE - margin), 255, -1)
-    mask_inner = cv2.bitwise_and(mask, center_mask)
+    # 4) Classify each square
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = OUT_DIR / f"labels_{ts}.csv"
+    board_png = OUT_DIR / f"labels_board_{ts}.png"
 
-    # Morphological cleanup
-    k = max(3, CLOSE_K | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    closed = cv2.morphologyEx(mask_inner, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # draw + write
+    vis = warp.copy()
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["square_name", "color", "piece_code", "label", "cosine"])
 
-    # Candidate filtering
-    Hh, Ww = closed.shape
-    min_area = Hh * Ww * MIN_INNER_AREA_FRAC
-    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for name, (x1,y1,x2,y2), crop in squares:
+            lab, cos = classify_roi(crop, prototypes)
+            draw_text, color, piece_code = label_to_drawables(lab)
 
-    candidates = []
-    for c in cnts:
-        if cv2.contourArea(c) < min_area:
-            continue
-        hull = cv2.convexHull(c)
-        rect = cv2.minAreaRect(hull)
-        (w, h) = rect[1]
-        if w == 0 or h == 0:
-            continue
-        ar = max(w, h) / (min(w, h) + 1e-6)
-        if ar > AR_TOL:
-            continue
-        if rectangularity(hull) < RECTANGULARITY_MIN:
-            continue
-        candidates.append((cv2.contourArea(hull), rect))
+            # CSV row
+            w.writerow([name, color, piece_code, lab, f"{cos:.4f}"])
 
-    if not candidates:
-        raise RuntimeError("Inner blue square not found.")
-
-    # Pick the smallest candidate (inner square)
-    candidates.sort(key=lambda x: x[0])
-    best_rect_sq = snap_rect_to_square(candidates[0][1])
-    inner_pts = rect_to_points(best_rect_sq)
-
-    # Crop to inner square
-    side = int(max(
-        np.linalg.norm(inner_pts[0] - inner_pts[1]),
-        np.linalg.norm(inner_pts[1] - inner_pts[2]),
-        np.linalg.norm(inner_pts[2] - inner_pts[3]),
-        np.linalg.norm(inner_pts[3] - inner_pts[0]),
-    ))
-    side = max(side, 200)
-    dst2 = np.array([[0,0],[side-1,0],[side-1,side-1],[0,side-1]], dtype=np.float32)
-    H2 = cv2.getPerspectiveTransform(inner_pts, dst2)
-    crop = cv2.warpPerspective(warp, H2, (side, side))
-
-    # ===== Remove all shades of blue =====
-    # ===== Remove all shades of blue and crop =====
-    hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    blue_mask = cv2.inRange(hsv_crop, LOWER_BLUE_REMOVAL, UPPER_BLUE)
-
-    # Invert mask to keep non-blue regions
-    non_blue_mask = cv2.bitwise_not(blue_mask)
-
-    # Apply mask
-    non_blue = cv2.bitwise_and(crop, crop, mask=non_blue_mask)
-
-    # Find bounding box of non-blue pixels
-    coords = cv2.findNonZero(non_blue_mask)
-    if coords is not None:
-        x, y, w, h = cv2.boundingRect(coords)
-        crop = non_blue[y:y+h, x:x+w]
-    else:
-        raise RuntimeError("No non-blue region found after masking.")
-
-    # ===== Robust grid estimation (projection-based, piece-robust) =====
-    verticals, horizontals = estimate_grid_positions(crop, n=9, win_frac=0.045, smooth_frac=0.035)
-
-
-    def dedup_and_fill(vals, size, max_len):
-        vals = sorted(set(vals))
-        # deduplicate close values
-        filtered = []
-        for v in vals:
-            if not filtered or abs(v - filtered[-1]) > 10:
-                filtered.append(v)
-
-        # if we have fewer than expected → interpolate
-        if len(filtered) < size:
-            start, end = 0, max_len - 1
-            filtered = np.linspace(start, end, size, dtype=int).tolist()
-
-        # if too many, thin them evenly
-        if len(filtered) > size:
-            idxs = np.linspace(0, len(filtered)-1, size, dtype=int)
-            filtered = [filtered[i] for i in idxs]
-
-        return filtered
-        # ---- PIECE DETECTION CONSTANTS (red pawn implemented; others placeholders) ----
-        
-    LOWER_RED1 = np.array([0, 100, 80],  dtype=np.uint8)
-    UPPER_RED1 = np.array([10, 255, 255], dtype=np.uint8)
-    LOWER_RED2 = np.array([160, 100, 80], dtype=np.uint8)
-    UPPER_RED2 = np.array([179, 255, 255], dtype=np.uint8)
-
-    PIECE_MIN_FRAC = 0.03   # >=3% of square pixels in color mask => treat as present
-    BRIGHTNESS_SPLIT = 140  # V-channel mean to decide White vs Black piece
-
-    def detect_red_pawn(roi_bgr):
-        """Return ('P','White'/'Black') if red pawn present, else (None,None)."""
-        hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv, LOWER_RED1, UPPER_RED1)
-        mask2 = cv2.inRange(hsv, LOWER_RED2, UPPER_RED2)
-        mask  = cv2.bitwise_or(mask1, mask2)
-
-        area = roi_bgr.shape[0] * roi_bgr.shape[1]
-        if area == 0:
-            return (None, None)
-
-        count = cv2.countNonZero(mask)
-        if count >= area * PIECE_MIN_FRAC:
-            vals = hsv[:, :, 2][mask > 0]
-            color = "White" if (np.mean(vals) if vals.size else 0) >= BRIGHTNESS_SPLIT else "Black"
-            return ('P', color)
-        return (None, None)
-
-    # ---- BUILD SQUARES, LABEL, AND OUTPUT BOARD LIST ----
-    verticals   = sorted(verticals)
-    horizontals = sorted(horizontals)
-    h, w = crop.shape[:2]
-    grid = crop.copy()
-
-    files_nums   = [str(i) for i in range(1, 9)]                 # 1..8 (left -> right)
-    ranks_letters = [chr(ord('A') + i) for i in range(8)]        # A..H (top -> bottom)
-
-    # optional: store coords + piece info for later use
-    square_info = {}
-
-    # your requested list: [ ((Piece, Color), number, letter), ... ]  (64 items)
-    board_list = []
-
-    # helper for pretty text
-    PIECE_NAME = {'P': 'pawn', 'N': 'knight', 'B': 'bishop', 'R': 'rook', 'Q': 'queen', 'K': 'king'}
-
-    for row in range(8):        # A..H (top -> bottom)
-        for col in range(8):    # 1..8 (left -> right)
-            x1, x2 = int(verticals[col]), int(verticals[col+1])
-            y1, y2 = int(horizontals[row]), int(horizontals[row+1])
-
-            roi = crop[y1:y2, x1:x2]
-
-            # --- detect pieces ---
-            piece_code, piece_color = detect_red_pawn(roi)  # 'P' or None, 'White'/'Black' or None
-
-            # TODO (placeholders): add color-coded detectors for N, B, R, Q later
-            # piece_code, piece_color = detect_knight(roi) or existing result ...
-            # piece_code, piece_color = detect_bishop(roi) ...
-            # piece_code, piece_color = detect_rook(roi) ...
-            # piece_code, piece_color = detect_queen(roi) ...
-
-            # --- store metadata ---
-            square_name = f"{ranks_letters[row]}{files_nums[col]}"
-            # square_info[square_name] = {
-            #     "coords": [x1, y1, x2, y2],
-            #     "piece": {
-            #         "code": piece_code,                  # 'P' or None
-            #         "type": PIECE_NAME.get(piece_code),  # 'pawn' or None
-            #         "color": piece_color                 # 'White'/'Black' or None
-            #     }
-            # }
-            # ((Piece, Color), number, letter)  -->  (None, number, letter) if empty
-            first = (piece_code, piece_color) if piece_code else None
-            board_list.append((first, files_nums[col], ranks_letters[row]))
-
-            # --- draw labels (two lines) ---
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cv2.putText(grid, square_name, (cx - 20, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
-            if piece_code:
-                piece_label = f"{piece_color} {PIECE_NAME[piece_code]}"
-                cv2.putText(grid, piece_label, (cx - 35, cy + 16),
+            # Draw
+            cx, cy = (x1+x2)//2, (y1+y2)//2
+            cv2.rectangle(vis, (x1,y1), (x2,y2), (0,0,255), 1)
+            cv2.putText(vis, name, (x1+6, y1+18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
+            if lab != "empty":
+                cv2.putText(vis, f"{draw_text} ({cos:.2f})", (cx-60, cy+18),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,0), 1, cv2.LINE_AA)
 
-            # --- append to requested board list ---
-            # ((Piece, Color), number, letter)
+    cv2.imwrite(str(board_png), vis)
+    print(f"\nSaved labels CSV → {csv_path}")
+    print(f"Saved annotated board → {board_png}")
+    print(f"Classes used: {sorted(prototypes.keys())}")
+    print(f"(CONF_UNKNOWN_TH={CONF_UNKNOWN_TH:.2f}; increase to be stricter, decrease to be more permissive.)")
 
-    # Save labeled image
-    cv2.imwrite(str(OUT_GRID), grid)
-
-
-    # # Save the 64-tuple list in a Python-friendly text file and also print it
-    # OUT_BOARD_LIST = OUT_DIR / "board_list.txt"
-    # with open(OUT_BOARD_LIST, "w") as f:
-    #     f.write(repr(board_list))
-
-    print("Board list (64 tuples):")
-    print(board_list)
-    print(f"\nSaved labeled board image: {OUT_GRID}")
-
-    h, w = crop.shape[:2]
-    verticals   = dedup_and_fill(verticals,   9, w)
-    horizontals = dedup_and_fill(horizontals, 9, h)
-
-    # draw grid
-    h, w = crop.shape[:2]
-    verticals   = dedup_and_fill(verticals,   9, w)
-    horizontals = dedup_and_fill(horizontals, 9, h)
-
-    verticals = sorted(verticals)
-    horizontals = sorted(horizontals)
-
-    # build chessboard squares
-    files = [str(i) for i in range(1,9)]   # left to right
-    ranks = [chr(ord('A')+i) for i in range(8)]  # A..H top to bottom
-
-    grid = crop.copy()
-    square_info = {}
-
-
-    for row in range(8):       # rank (A..H, top→bottom)
-        for col in range(8):   # file (1..8, left→right)
-            x1, x2 = verticals[col], verticals[col+1]
-            y1, y2 = horizontals[row], horizontals[row+1]
-
-            # square coordinates
-            roi = crop[y1:y2, x1:x2]
-            square_name = f"{ranks[row]}{files[col]}"
-
-            # save metadata
-            piece_entry = {"code": piece_code, "type": PIECE_NAME.get(piece_code), "color": piece_color} \
-              if piece_code else None
-            
-            square_info[square_name] = {
-                "coords": [x1, y1, x2, y2],
-                "piece": piece_entry
-            }
-            # draw rectangle
-            cv2.rectangle(grid, (x1,y1), (x2,y2), (0,0,255), 1)
-
-            # put text in center
-            cx, cy = (x1+x2)//2, (y1+y2)//2
-
-                        # --- Piece detection by color coding ---
-            piece_type = None
-            piece_color = None
-
-            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-            # Red mask (Pawn)
-            mask_red1 = cv2.inRange(hsv_roi, LOWER_RED1, UPPER_RED1)
-            mask_red2 = cv2.inRange(hsv_roi, LOWER_RED2, UPPER_RED2)
-            mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-
-            red_pixels = cv2.countNonZero(mask_red)
-            area = roi.shape[0] * roi.shape[1]
-
-            if red_pixels > area * 0.05:  # ≥5% of square is red
-                piece_type = "pawn"
-
-                # Piece color (white/black) → based on brightness
-                vals = hsv_roi[:,:,2][mask_red > 0]  # V channel where piece is
-                if np.mean(vals) > 128:
-                    piece_color = "white"
-                else:
-                    piece_color = "black"
-
-            # TODO: Add knight, rook, bishop, queen detections here later
-
-            # Save metadata
-            square_info[square_name] = {
-                "coords": [int(x1), int(y1), int(x2), int(y2)],
-                "piece": {
-                    "type": piece_type if piece_type else "empty",
-                    "color": piece_color if piece_color else None
-                }
-            }
-
-            # Draw label on grid
-            label = square_name
-
-            cv2.putText(grid, square_name, (cx-20, cy),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100,255,100), 1, cv2.LINE_AA)
-
-            # Draw piece info (if exists) just below the name
-            if piece_type:
-                piece_label = f"{piece_color} {piece_type}"
-                cv2.putText(grid, piece_label, (cx-35, cy+15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
-
-
-    # Save annotated grid
-    cv2.imwrite(str(OUT_GRID), grid)
-
-    def return_board():
-        return board_list
-
-    # Save coords back in original image space
-    H_inv = np.linalg.inv(H)
-    inner_pts_h = np.hstack([inner_pts, np.ones((4,1), dtype=np.float32)])
-    inner_orig = (H_inv @ inner_pts_h.T).T
-    inner_orig = (inner_orig[:, :2] / inner_orig[:, 2:3]).astype(float)
-
-    print("Saved:")
-    print(f"  Final labeled chessboard image : {OUT_GRID}")
-    
 if __name__ == "__main__":
     main()
