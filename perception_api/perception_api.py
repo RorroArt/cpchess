@@ -24,7 +24,7 @@ from transformers import CLIPProcessor, CLIPModel
 from memory_store import Memory  # JSON-backed memory
 
 # ====== CONFIG ======
-ROOT = Path("/Users/andredelacruz/Documents/GitHub/cpchess/perception_api")
+ROOT = Path("./")
 
 # Embeddings live under ROOT / "embeddings"
 EMB_DIR = ROOT / "embeddings"
@@ -191,21 +191,24 @@ def compute_homography(frame_bgr):
     raise RuntimeError("Could not find chessboard inner corners (7x7). Check lighting/contrast and board size in frame.")
 
 
+# def capture_frame(index=0):
+#     cap = cv2.VideoCapture(index)
+#     if not cap.isOpened():
+#         raise RuntimeError("Could not open camera.")
+#     cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+#     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+#     ok, frame = cap.read()
+#     cap.release()
+#     if not ok:
+#         raise RuntimeError("Failed to capture image.")
+#     return frame
+
 def capture_frame(index=0):
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open camera.")
-    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        raise RuntimeError("Failed to capture image.")
-    return frame
+    return cv2.imread(ROOT/"test.png")
 
 def map_rc_to_name(c, r):
-    # Your custom mapping: c = file index 0..7 (A..H), r = rank index 0..7 (8..1)
     return f"{'ABCDEFGH'[c]}{'87654321'[r]}"
+
 
 @torch.no_grad()
 def embed_bgr(img_bgr: np.ndarray) -> torch.Tensor:
@@ -428,7 +431,7 @@ def calibrate_empty_grid(num_frames: int = 5):
         H = compute_homography(frame)
         warp = cv2.warpPerspective(frame, H, (BOARD_SIDE, BOARD_SIDE))
 
-        # Use the SAME orientation pipeline as the classify path
+
         warp = cv2.flip(warp, 1)
         warp = cv2.flip(warp, 0)
         warp = cv2.rotate(warp, cv2.ROTATE_90_CLOCKWISE)
