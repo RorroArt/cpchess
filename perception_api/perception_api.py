@@ -191,20 +191,17 @@ def compute_homography(frame_bgr):
     raise RuntimeError("Could not find chessboard inner corners (7x7). Check lighting/contrast and board size in frame.")
 
 
-# def capture_frame(index=0):
-#     cap = cv2.VideoCapture(index)
-#     if not cap.isOpened():
-#         raise RuntimeError("Could not open camera.")
-#     cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-#     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-#     ok, frame = cap.read()
-#     cap.release()
-#     if not ok:
-#         raise RuntimeError("Failed to capture image.")
-#     return frame
-
 def capture_frame(index=0):
-    return cv2.imread(ROOT/"test.png")
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open camera.")
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError("Failed to capture image.")
+    return frame
 
 def map_rc_to_name(c, r):
     return f"{'ABCDEFGH'[c]}{'87654321'[r]}"
